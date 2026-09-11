@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Imaging;
@@ -6,6 +6,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Reflection;
+using System.Security.Cryptography;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -31,66 +32,120 @@ namespace YMM4McpPlugin
         struct RECT { public int Left, Top, Right, Bottom; }
         const uint PW_RENDERFULLCONTENT = 2; // DirectX/OpenGL対応フラグ
 
+        private readonly object _lifecycle = new();
         private HttpListener? _listener;
-        private CancellationTokenSource? _cts;
-        private bool _isRunning = false;
-
-        public const int Port = 8765;
-        public string BaseUrl => $"http://localhost:{Port}/";
-        public bool IsRunning => _isRunning;
+        private string _token = "";
+        private bool _allowAdvanced;
+        public McpSettings Settings { get; } = McpSettings.Load();
+        public int Port => Settings.Port;
+        public string BaseUrl => $"http://127.0.0.1:{Port}/";
+        public bool IsRunning => _listener?.IsListening == true;
         public event Action<string>? LogMessage;
+        public event Action? StateChanged;
 
         public void Start()
         {
-            if (_isRunning) return;
-            _cts = new CancellationTokenSource();
-            _listener = new HttpListener();
-            _listener.Prefixes.Add(BaseUrl);
-            _listener.Start();
-            _isRunning = true;
-            Task.Run(() => ListenLoop(_cts.Token));
+            lock (_lifecycle)
+            {
+                if (IsRunning) return;
+                Settings.Validate();
+                McpSettings.PrepareDirectory();
+                var listener = new HttpListener();
+                listener.Prefixes.Add(BaseUrl);
+                try
+                {
+                    listener.Start();
+                    string token = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
+                    string temp = McpSettings.ConnectionPath + ".tmp";
+                    File.WriteAllText(temp, JsonSerializer.Serialize(new { api_base = BaseUrl + "api", token }));
+                    File.Move(temp, McpSettings.ConnectionPath, true);
+                    _token = token;
+                    _allowAdvanced = Settings.AllowAdvanced;
+                    _listener = listener;
+                    _ = ListenLoop(listener);
+                }
+                catch { listener.Close(); throw; }
+            }
+            StateChanged?.Invoke();
             Log($"MCPサーバー起動: {BaseUrl}");
         }
 
         public void Stop()
         {
-            if (!_isRunning) return;
-            _cts?.Cancel();
-            _listener?.Stop();
-            _listener = null;
-            _isRunning = false;
+            lock (_lifecycle)
+            {
+                var listener = _listener;
+                _listener = null;
+                listener?.Close();
+                _token = "";
+                // Keep the protected discovery file: clients can distinguish connection
+                // refusal after shutdown; the token is rotated on the next start.
+            }
+            StateChanged?.Invoke();
             Log("MCPサーバー停止");
         }
 
-        private async Task ListenLoop(CancellationToken ct)
+        private async Task ListenLoop(HttpListener listener)
         {
-            while (!ct.IsCancellationRequested && _listener != null)
+            try
             {
-                try { var ctx = await _listener.GetContextAsync(); _ = Task.Run(() => HandleRequest(ctx), ct); }
-                catch (HttpListenerException) { break; }
-                catch (ObjectDisposedException) { break; }
-                catch (Exception ex) { Log($"エラー: {ex.Message}"); }
+                while (listener.IsListening)
+                {
+                    var ctx = await listener.GetContextAsync();
+                    _ = HandleRequest(ctx);
+                }
             }
+            catch (HttpListenerException) { }
+            catch (ObjectDisposedException) { }
+            catch (Exception ex) { Log($"HTTP listener error: {ex.Message}"); }
+            finally
+            {
+                lock (_lifecycle)
+                {
+                    listener.Close();
+                    if (ReferenceEquals(_listener, listener)) _listener = null;
+                }
+                StateChanged?.Invoke();
+            }
+        }
+
+        private bool IsAuthenticated(HttpListenerRequest request)
+        {
+            string expected = _token;
+            string supplied = request.Headers["X-Ymm4-Token"] ?? "";
+            return expected.Length > 0 && supplied.Length == expected.Length &&
+                CryptographicOperations.FixedTimeEquals(Encoding.UTF8.GetBytes(expected), Encoding.UTF8.GetBytes(supplied));
         }
 
         private async Task HandleRequest(HttpListenerContext context)
         {
             var req = context.Request;
             var res = context.Response;
-            res.AddHeader("Access-Control-Allow-Origin", "*");
-            res.AddHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-            res.AddHeader("Access-Control-Allow-Headers", "Content-Type");
-            if (req.HttpMethod == "OPTIONS") { res.StatusCode = 204; res.Close(); return; }
-
             try
             {
                 string path = req.Url?.AbsolutePath ?? "/";
+                if (!IsAuthenticated(req))
+                {
+                    await WriteJson(res, 401, new { success = false, error_code = "UNAUTHORIZED", error = "X-Ymm4-Token is required" });
+                    return;
+                }
+                if (req.Headers["Origin"] != null || req.Headers["Sec-Fetch-Site"] != null)
+                {
+                    await WriteJson(res, 403, new { success = false, error_code = "BROWSER_REQUEST_DENIED", error = "Browser requests are not supported" });
+                    return;
+                }
+                if (!_allowAdvanced && (path.StartsWith("/api/reflect/", StringComparison.Ordinal) || path.StartsWith("/api/debug/", StringComparison.Ordinal) || path == "/api/commands"))
+                {
+                    await WriteJson(res, 403, new { success = false, error_code = "ADVANCED_DISABLED", error = "Enable advanced APIs in the plugin settings and restart" });
+                    return;
+                }
                 Log($"{req.HttpMethod} {path}");
                 object? result = (req.HttpMethod, path) switch
                 {
                     ("GET", "/api/status") => GetStatus(),
                     ("GET", "/api/project") => GetProjectInfo(),
                     ("GET", "/api/items") => GetTimelineItems(),
+#if DEBUG
                     ("GET", "/api/debug/vm") => DebugViewModel(),
                     ("GET", "/api/debug/timeline") => DebugTimeline(),
                     ("GET", "/api/debug/items") => DebugItems(),
@@ -105,6 +160,7 @@ namespace YMM4McpPlugin
                     ("GET", "/api/debug/type") => GetTypeInfo(req),
                     ("GET", "/api/debug/timelinemethods") => DebugTimelineMethods(),
                     ("GET", "/api/debug/voicetypes") => DebugVoiceTypes(),
+#endif
                     ("POST", "/api/items/text") => await AddTextItem(req),
                     ("POST", "/api/items/voice") => await AddVoiceItem(req),
                     ("POST", "/api/items/reorder") => await ReorderItems(req),
@@ -118,13 +174,17 @@ namespace YMM4McpPlugin
                     ("POST", "/api/items/prop") => await SetItemProp(req),
                     ("GET", "/api/effects/list") => ListEffects(),
                     ("POST", "/api/items/delete") => await DeleteItems(req),
+#if DEBUG
                     ("GET", "/api/debug/tachie") => DebugTachie(),
                     ("GET", "/api/debug/tachie/props") => DebugTachieItemProps(),
                     ("GET", "/api/debug/facetypes") => DebugFaceTypes(),
                     ("GET", "/api/debug/voiceitem/props") => DebugVoiceItemProps(),
+#endif
                     ("POST", "/api/items/effect/audio") => await AddAudioEffect(req),
+#if DEBUG
                     ("GET", "/api/debug/visualtree") => DebugVisualTree(req),
                     ("GET", "/api/debug/player") => DebugPlayer(),
+#endif
                     ("GET", "/api/preview/capture") => CapturePreview(req),
                     ("POST", "/api/preview/seek") => await SeekAndCapture(req),
                     ("GET", "/api/preview/position") => GetPlaybackPosition(),
@@ -154,7 +214,13 @@ namespace YMM4McpPlugin
                 if (result == null) { await WriteJson(res, 404, new { error = "Not Found", path }); return; }
                 await WriteJson(res, 200, result);
             }
-            catch (Exception ex) { Log($"エラー: {ex.Message}"); await WriteJson(res, 500, new { error = ex.Message }); }
+            catch (Exception ex)
+            {
+                Log($"エラー: {ex.Message}");
+                try { await WriteJson(res, ex is ArgumentException || ex is JsonException ? 400 : 500,
+                    new { success = false, error_code = ex is ArgumentException || ex is JsonException ? "INVALID_ARGUMENT" : "INTERNAL_ERROR", error = ex.Message, retryable = false }); }
+                catch { res.Abort(); }
+            }
         }
 
         private static async Task WriteJson(HttpListenerResponse res, int status, object data)
@@ -1430,6 +1496,9 @@ namespace YMM4McpPlugin
             }
             if (string.IsNullOrEmpty(name)) return new { success = false, error = "name パラメータが必要です" };
 
+            if (!_allowAdvanced && !((target == "Main" && (name == "UndoCommand" || name == "RedoCommand")) ||
+                (target == "ActiveTimeline" && (name == "SplitItemCommand" || name == "AlignItemsCommand"))))
+                return new { success = false, error_code = "ADVANCED_DISABLED", error = "This command requires advanced APIs" };
             return Application.Current.Dispatcher.Invoke(() =>
             {
                 var obj = ResolveTarget(target);
@@ -2276,10 +2345,20 @@ namespace YMM4McpPlugin
 
         private static async Task<Dictionary<string, JsonElement>> ReadBody(HttpListenerRequest req)
         {
-            if (req.ContentLength64 <= 0) return new();
-            using var r = new System.IO.StreamReader(req.InputStream, Encoding.UTF8);
-            var body = await r.ReadToEndAsync();
-            return string.IsNullOrWhiteSpace(body) ? new() : JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(body) ?? new();
+            const int maxBytes = 1024 * 1024;
+            if (req.ContentLength64 > maxBytes) throw new ArgumentException("Request body exceeds 1 MiB");
+            using var buffer = new MemoryStream();
+            var chunk = new byte[8192];
+            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            int count;
+            while ((count = await req.InputStream.ReadAsync(chunk.AsMemory(), deadline.Token)) > 0)
+            {
+                if (buffer.Length + count > maxBytes) throw new ArgumentException("Request body exceeds 1 MiB");
+                buffer.Write(chunk, 0, count);
+            }
+            if (buffer.Length == 0) return new();
+            return JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(buffer.ToArray())
+                ?? throw new ArgumentException("JSON object required");
         }
 
         private static string GetStr(Dictionary<string, JsonElement> d, string k, string def) => d.TryGetValue(k, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() ?? def : def;
