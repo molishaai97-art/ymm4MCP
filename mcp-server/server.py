@@ -46,7 +46,10 @@ except Exception:
 # YMM4プラグインのHTTP API URL
 YMM4_API_BASE = "http://127.0.0.1:8765/api"
 
+from mcp_skills import register_skills
+
 app = Server("ymm4-mcp")
+register_skills(app)
 
 # ============================================================
 # HTTPクライアント
@@ -110,7 +113,7 @@ TOOLS = [
     Tool(
         name="ymm4_interact",
         description=(
-            "YMM4を操作・情報取得するための単一ツール。"
+            "YMM4を操作・情報取得するための単一ツール。制作前にymm4://skills/{jikkyou,kaisetsu,chaban,story}の該当リソースを読んでください。"
             "action='get_info'(status/project/items/effects_list/selection/commands/effects), "
             "'control'(play/stop/save/undo/redo/split/align), "
             "'add_item'(text/voice/tachie/face), "
