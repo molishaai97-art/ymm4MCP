@@ -9,6 +9,8 @@ namespace YMM4McpPlugin
     /// </summary>
     public class McpToolPlugin : IToolPlugin
     {
+        public McpToolPlugin() => McpViewModel.InitializePlugin();
+
         public string Name => "MCP連携サーバー";
         public Type ViewModelType => typeof(McpViewModel);
         public Type ViewType => typeof(McpView);
