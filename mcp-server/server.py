@@ -24,6 +24,7 @@ import os
 import sys
 from typing import Any
 import httpx
+from ymm4_connection import connection_settings, advanced_enabled
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import (
@@ -43,7 +44,7 @@ except Exception:
     import gemini_video  # type: ignore
 
 # YMM4プラグインのHTTP API URL
-YMM4_API_BASE = "http://localhost:8765/api"
+YMM4_API_BASE = "http://127.0.0.1:8765/api"
 
 app = Server("ymm4-mcp")
 
@@ -60,7 +61,7 @@ def _get_http_client() -> httpx.AsyncClient:
     """同じイベントループ上でHTTP接続プールを再利用する。"""
     global _http_client
     if _http_client is None or _http_client.is_closed:
-        _http_client = httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS)
+        _http_client = httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS, trust_env=False)
     return _http_client
 
 
@@ -74,7 +75,8 @@ async def close_http_client() -> None:
 
 async def ymm4_get(path: str) -> dict:
     """YMM4 API GETリクエスト"""
-    res = await _get_http_client().get(f"{YMM4_API_BASE}{path}")
+    base, headers = connection_settings()
+    res = await _get_http_client().get(f"{base}{path}", headers=headers)
     res.raise_for_status()
     return res.json()
 
@@ -83,8 +85,9 @@ async def ymm4_post(
     path: str, body: dict | None = None, *, timeout: float = HTTP_TIMEOUT_SECONDS
 ) -> dict:
     """応答待ち時間だけをリクエスト単位で変更し、接続待ちは10秒に保つ。"""
+    base, headers = connection_settings()
     res = await _get_http_client().post(
-        f"{YMM4_API_BASE}{path}",
+        f"{base}{path}", headers=headers,
         json=body if body is not None else {},
         timeout=httpx.Timeout(HTTP_TIMEOUT_SECONDS, read=timeout),
     )
@@ -274,21 +277,30 @@ async def call_tool(name: str, arguments: dict) -> CallToolResult:
             result = await dispatch_preview(arguments)
             return result
         if name == "ymm4_advanced":
+            if not advanced_enabled():
+                raise ValueError("高度APIは無効です。YMM4_ENABLE_ADVANCED=1とプラグイン側の許可が必要です")
             result = await dispatch_advanced(arguments)
-            return CallToolResult(content=[TextContent(type="text", text=format_result(result))])
+            return CallToolResult(content=[TextContent(type="text", text=format_result(result))],
+                                  isError=isinstance(result, dict) and (result.get("success") is False or "error" in result))
         if name == "ymm4_analyze_video":
             result = await analyze_video(arguments)
-            return CallToolResult(content=[TextContent(type="text", text=format_result(result))])
+            return CallToolResult(content=[TextContent(type="text", text=format_result(result))],
+                                  isError=isinstance(result, dict) and (result.get("success") is False or "error" in result))
         if name != "ymm4_interact":
             raise ValueError(f"Unknown tool: {name}")
         result = await dispatch(arguments)
-        return CallToolResult(content=[TextContent(type="text", text=format_result(result))])
+        return CallToolResult(content=[TextContent(type="text", text=format_result(result))],
+                                  isError=isinstance(result, dict) and (result.get("success") is False or "error" in result))
     except (httpx.ConnectError, httpx.ConnectTimeout):
         msg = (
             "❌ YMM4プラグインサーバーに接続できません。\n"
             "YMM4を起動し、ツールメニューから「MCP連携サーバー」を開いて「▶ 起動」ボタンを押してください。"
         )
         return CallToolResult(content=[TextContent(type="text", text=msg)], isError=True)
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        message = {401: "認証失敗。プラグインを再起動し接続情報を確認してください", 403: "APIの利用が許可されていません"}.get(status, f"YMM4 HTTPエラー: {status}")
+        return CallToolResult(content=[TextContent(type="text", text=message)], isError=True)
     except httpx.TimeoutException:
         msg = (
             "YMM4プラグインサーバーの処理待ちがタイムアウトしました。\n"
