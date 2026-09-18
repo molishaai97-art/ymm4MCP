@@ -16,6 +16,11 @@ import server
 
 class HttpTimeoutTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        config = patch.object(server, "connection_settings", return_value=(
+            "http://127.0.0.1:8765/api", {"X-Ymm4-Token": "test-token"}
+        ))
+        config.start()
+        self.addCleanup(config.stop)
         self.requests = []
         self.response = {"success": True, "image": "aW1hZ2U="}
         self.failure = None
